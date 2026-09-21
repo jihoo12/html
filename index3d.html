@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Fluid Dynamics</title>
+<style>
+*{margin:0;padding:0}
+body{background:#000;overflow:hidden;font:13px/1.5 monospace;color:rgba(255,255,255,.5)}
+canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+#ui{position:fixed;top:12px;left:12px;pointer-events:none;text-shadow:0 1px 4px #000;z-index:1}
+#fps{position:fixed;top:12px;right:12px;pointer-events:none;text-shadow:0 1px 4px #000;z-index:1}
+#dbg{position:fixed;bottom:12px;left:12px;pointer-events:none;text-shadow:0 1px 4px #000;z-index:1;color:#ff0}
+</style>
+</head>
+<body>
+<div id="ui">
+  left drag: inject dye &amp; force<br>
+  shift+drag: dye only<br>
+  right drag: orbit camera<br>
+  scroll: brush size · shift+scroll: depth
+</div>
+<div id="fps"></div>
+<div id="dbg"></div>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false });
+if (!gl) { document.body.innerHTML = '<p style="color:#fff;padding:2em">WebGL2 required</p>'; throw 'no webgl2'; }
+
+const ext = gl.getExtension('EXT_color_buffer_float');
+const dbgEl = document.getElementById('dbg');
+function dbg(msg) { dbgEl.textContent = msg; console.log('[DBG]', msg); }
+dbg('EXT_color_buffer_float: ' + !!ext);
+
+// --- Config ---
+const N = 64;
+const PRESSURE_ITERS = 20;
+const DT = 0.012;
+const VEL_DISS = 0.998;
+const DYE_DISS = 0.995;
+
+// --- Resize ---
+let W, H;
+function resize() { W = canvas.clientWidth; H = canvas.clientHeight; canvas.width = W; canvas.height = H; }
+resize();
+window.addEventListener('resize', resize);
+
+// --- Shader helpers ---
+function mkShader(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    console.error('Shader compile [' + label + ']:', log);
+    dbg('SHADER ERROR [' + label + ']: ' + log.substring(0, 200));
+    return null;
+  }
+  return s;
+}
+
+function mkProgram(vsSrc, fsSrc, label) {
+  const vs = mkShader(gl.VERTEX_SHADER, vsSrc, label + '-vs');
+  const fs = mkShader(gl.FRAGMENT_SHADER, fsSrc, label + '-fs');
+  if (!vs || !fs) return null;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('Link [' + label + ']:', gl.getProgramInfoLog(p));
+    dbg('LINK ERROR [' + label + ']');
+    return null;
+  }
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    u[info.name] = gl.getUniformLocation(p, info.name);
+  }
+  return { p, uniforms: u };
+}
+
+// --- Fullscreen quad ---
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+let boundProg = null;
+function useProg(prog) {
+  if (!prog) return;
+  gl.useProgram(prog.p);
+  boundProg = prog;
+}
+function bindQuad() {
+  const loc = gl.getAttribLocation(boundProg.p, 'aPos');
+  if (loc < 0) { dbg('aPos not found!'); return; }
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+// --- 2D Array FBO ---
+function makeArrayFBO(w, h, d, filter) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA16F, w, h, d, 0, gl.RGBA, gl.FLOAT, null);
+  const fbos = [];
+  for (let i = 0; i < d; i++) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, i);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      dbg('FBO incomplete layer ' + i + ': 0x' + status.toString(16));
+    }
+    fbos.push(fbo);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbos, w, h, d };
+}
+
+function makeDoubleFBO(w, h, d, filter) {
+  let a = makeArrayFBO(w, h, d, filter);
+  let b = makeArrayFBO(w, h, d, filter);
+  return { w, h, d, get read(){return a}, get write(){return b}, swap(){const t=a;a=b;b=t;} };
+}
+
+// --- Create FBOs ---
+const vel = makeDoubleFBO(N, N, N, gl.LINEAR);
+const dye = makeDoubleFBO(N, N, N, gl.LINEAR);
+const pres = makeDoubleFBO(N, N, N, gl.NEAREST);
+const divFBO = makeArrayFBO(N, N, N, gl.NEAREST);
+dbg('FBOs created: ' + N + '^3');
+
+// --- Shaders ---
+
+const VERT = `#version 300 es
+in vec2 aPos;
+out vec2 vUv;
+void main(){
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const ADVECT = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uVel, uSrc;
+uniform vec3 texelSize;
+uniform float dt, dissipation;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec2 ts = vec2(textureSize(uVel, 0).xy);
+  vec3 c = vec3(vUv * ts, float(slice));
+  vec3 v = texture(uVel, c).xyz;
+  vec3 nc = c - vec3(v.x * dt * texelSize.x, v.y * dt * texelSize.y, v.z * dt * texelSize.z);
+  nc = clamp(nc, vec3(0.5), vec3(ts.x - 0.5, ts.y - 0.5, float(textureSize(uSrc,0).z) - 0.5));
+  fragColor = dissipation * texture(uSrc, nc);
+}`;
+
+const DIVERGENCE = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uVel;
+uniform vec3 texelSize;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec3 c = vec3(vUv * vec2(textureSize(uVel,0).xy), float(slice));
+  float L = texture(uVel, c - vec3(1,0,0)).x;
+  float R = texture(uVel, c + vec3(1,0,0)).x;
+  float T = texture(uVel, c + vec3(0,1,0)).y;
+  float B = texture(uVel, c - vec3(0,1,0)).y;
+  float F = texture(uVel, c + vec3(0,0,1)).z;
+  float K = texture(uVel, c - vec3(0,0,1)).z;
+  fragColor = vec4(0.5 * (R - L + T - B + F - K), 0.0, 0.0, 1.0);
+}`;
+
+const JACOBI = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uX, uB;
+uniform vec3 texelSize;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec3 c = vec3(vUv * vec2(textureSize(uX,0).xy), float(slice));
+  float L = texture(uX, c - vec3(1,0,0)).x;
+  float R = texture(uX, c + vec3(1,0,0)).x;
+  float T = texture(uX, c + vec3(0,1,0)).x;
+  float B = texture(uX, c - vec3(0,1,0)).x;
+  float F = texture(uX, c + vec3(0,0,1)).x;
+  float K = texture(uX, c - vec3(0,0,1)).x;
+  float b = texture(uB, c).x;
+  fragColor = vec4((L + R + T + B + F + K - b) / 6.0, 0.0, 0.0, 1.0);
+}`;
+
+const GRADIENT = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uP, uV;
+uniform vec3 texelSize;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec3 c = vec3(vUv * vec2(textureSize(uP,0).xy), float(slice));
+  float L = texture(uP, c - vec3(1,0,0)).x;
+  float R = texture(uP, c + vec3(1,0,0)).x;
+  float T = texture(uP, c + vec3(0,1,0)).x;
+  float B = texture(uP, c - vec3(0,1,0)).x;
+  float F = texture(uP, c + vec3(0,0,1)).x;
+  float K = texture(uP, c - vec3(0,0,1)).x;
+  vec3 v = texture(uV, c).xyz - vec3(R - L, T - B, F - K) * 0.5;
+  fragColor = vec4(v, 1.0);
+}`;
+
+const SPLAT = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uTarget;
+uniform vec3 splatPoint, splatColor;
+uniform float splatRadius;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec2 ts = vec2(textureSize(uTarget,0).xy);
+  vec3 c = vec3(vUv * ts, float(slice));
+  vec3 sp = splatPoint * vec3(ts, float(textureSize(uTarget,0).z));
+  vec3 d = c - sp;
+  float dist = dot(d, d);
+  // splatRadius is passed in texel space already from JS
+  vec3 splat = exp(-dist / splatRadius) * splatColor;
+  fragColor = vec4(texture(uTarget, c).xyz + splat, 1.0);
+}`;
+
+const CLEAR_TEX = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uTex;
+uniform float amount;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec3 c = vec3(vUv * vec2(textureSize(uTex,0).xy), float(slice));
+  fragColor = amount * texture(uTex, c);
+}`;
+
+// Debug: simple slice viewer
+const SLICE_VIEW = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uTex;
+uniform int slice;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec2 ts = vec2(textureSize(uTex,0).xy);
+  vec3 c = vec3(vUv * ts, float(slice));
+  vec4 val = texture(uTex, c);
+  // Map to visible range
+  fragColor = vec4(val.rgb * 2.0, 1.0);
+}`;
+
+// Ray march display
+const DISPLAY = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray uDye;
+uniform mat4 invViewProj;
+uniform vec3 camPos;
+in vec2 vUv;
+out vec4 fragColor;
+
+vec3 sampleDye(vec3 p) {
+  p = clamp(p, vec3(0.001), vec3(0.999));
+  return texture(uDye, p * vec3(textureSize(uDye, 0))).rgb;
+}
+
+void main(){
+  vec4 clip = vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+  vec4 world = invViewProj * clip;
+  world.xyz /= world.w;
+  vec3 dir = normalize(world.xyz - camPos);
+
+  // Ray-AABB intersect unit cube [0,1]
+  vec3 invR = 1.0 / dir;
+  vec3 t0 = -camPos * invR;
+  vec3 t1 = (vec3(1.0) - camPos) * invR;
+  vec3 tminv = min(t0, t1);
+  vec3 tmaxv = max(t0, t1);
+  float tNear = max(max(tminv.x, tminv.y), tminv.z);
+  float tFar = min(min(tmaxv.x, tmaxv.y), tmaxv.z);
+
+  if (tFar < tNear || tFar < 0.0) {
+    fragColor = vec4(0.02, 0.02, 0.04, 1.0);
+    return;
+  }
+
+  float tStart = max(tNear, 0.0);
+  float stepLen = (tFar - tStart) / 64.0;
+  vec3 col = vec3(0.0);
+  float alpha = 0.0;
+
+  for (int i = 0; i < 64; i++) {
+    float t = tStart + float(i) * stepLen;
+    vec3 p = camPos + dir * t;
+    vec3 s = sampleDye(p);
+    float a = max(max(s.r, s.g), s.b) * 0.15;
+    a = clamp(a, 0.0, 1.0);
+    col += (1.0 - alpha) * a * s;
+    alpha += (1.0 - alpha) * a;
+    if (alpha > 0.97) break;
+  }
+
+  vec3 bg = vec3(0.015, 0.015, 0.03);
+  col = mix(bg, col, clamp(alpha, 0.0, 1.0));
+  col = pow(col, vec3(0.85));
+  fragColor = vec4(col, 1.0);
+}`;
+
+// --- Compile ---
+const P = {};
+const shaderNames = ['advect','divergence','jacobi','gradient','splat','clear','sliceView','display'];
+const shaderSrc = [ADVECT, DIVERGENCE, JACOBI, GRADIENT, SPLAT, CLEAR_TEX, SLICE_VIEW, DISPLAY];
+for (let i = 0; i < shaderNames.length; i++) {
+  P[shaderNames[i]] = mkProgram(VERT, shaderSrc[i], shaderNames[i]);
+  if (!P[shaderNames[i]]) dbg('FAILED: ' + shaderNames[i]);
+}
+
+// --- Texture binding ---
+let texUnit = 0;
+function bindTex(name, tex, prog) {
+  if (!prog || !prog.uniforms || !prog.uniforms[name]) {
+    dbg('bindTex FAIL: ' + name + ' prog=' + !!prog);
+    return;
+  }
+  gl.activeTexture(gl.TEXTURE0 + texUnit);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.uniform1i(prog.uniforms[name], texUnit);
+  texUnit++;
+}
+
+// --- Draw helpers ---
+function drawToFBO(fbo, prog, setupFn) {
+  useProg(prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, prog._w || N, prog._h || N);
+  bindQuad();
+  texUnit = 0;
+  setupFn();
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function drawToScreen(prog, setupFn) {
+  if (!prog) return;
+  useProg(prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  bindQuad();
+  texUnit = 0;
+  setupFn();
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// --- Simulation steps ---
+function advect3D(target, velArr, srcArr, dt, diss) {
+  const p = P.advect;
+  for (let z = 0; z < target.d; z++) {
+    gl.useProgram(p.p);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbos[z]);
+    gl.viewport(0, 0, target.w, target.h);
+    const loc = gl.getAttribLocation(p.p, 'aPos');
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    texUnit = 0;
+    bindTex('uVel', velArr.tex, p);
+    bindTex('uSrc', srcArr.tex, p);
+    gl.uniform3f(p.uniforms.texelSize, 1/velArr.w, 1/velArr.h, 1/velArr.d);
+    gl.uniform1f(p.uniforms.dt, dt);
+    gl.uniform1f(p.uniforms.dissipation, diss);
+    gl.uniform1i(p.uniforms.slice, z);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (z === 0) {
+      const err = gl.getError();
+      if (err !== 0) dbg('GL ERROR advect z=0: ' + err);
+    }
+  }
+}
+
+function computeDivergence(target, velArr) {
+  const p = P.divergence;
+  for (let z = 0; z < target.d; z++) {
+    drawToFBO(target.fbos[z], p, () => {
+      bindTex('uVel', velArr.tex, p);
+      gl.uniform3f(p.uniforms.texelSize, 1/velArr.w, 1/velArr.h, 1/velArr.d);
+      gl.uniform1i(p.uniforms.slice, z);
+    });
+  }
+}
+
+function solvePressure(target, presArr, divArr) {
+  const p = P.jacobi;
+  for (let z = 0; z < target.d; z++) {
+    drawToFBO(target.fbos[z], p, () => {
+      bindTex('uX', presArr.tex, p);
+      bindTex('uB', divArr.tex, p);
+      gl.uniform3f(p.uniforms.texelSize, 1/presArr.w, 1/presArr.h, 1/presArr.d);
+      gl.uniform1i(p.uniforms.slice, z);
+    });
+  }
+}
+
+function subtractGradient(target, presArr, velArr) {
+  const p = P.gradient;
+  for (let z = 0; z < target.d; z++) {
+    drawToFBO(target.fbos[z], p, () => {
+      bindTex('uP', presArr.tex, p);
+      bindTex('uV', velArr.tex, p);
+      gl.uniform3f(p.uniforms.texelSize, 1/presArr.w, 1/presArr.h, 1/presArr.d);
+      gl.uniform1i(p.uniforms.slice, z);
+    });
+  }
+}
+
+function doSplat(doubleFBO, point, color, radius) {
+  const p = P.splat;
+  const z = Math.floor(point[2] * doubleFBO.d);
+  const spread = 2;
+  for (let dz = -spread; dz <= spread; dz++) {
+    const zi = z + dz;
+    if (zi < 0 || zi >= doubleFBO.d) continue;
+    const fade = 1.0 - Math.abs(dz) / (spread + 1);
+    drawToFBO(doubleFBO.write.fbos[zi], p, () => {
+      bindTex('uTarget', doubleFBO.read.tex, p);
+      gl.uniform3f(p.uniforms.splatPoint, point[0], point[1], point[2]);
+      gl.uniform3f(p.uniforms.splatColor, color[0]*fade, color[1]*fade, color[2]*fade);
+      gl.uniform1f(p.uniforms.splatRadius, radius);
+      gl.uniform1i(p.uniforms.slice, zi);
+    });
+  }
+  doubleFBO.swap();
+}
+
+function clearDoubleFBO(doubleFBO, amount) {
+  const p = P.clear;
+  for (let z = 0; z < doubleFBO.d; z++) {
+    drawToFBO(doubleFBO.write.fbos[z], p, () => {
+      bindTex('uTex', doubleFBO.read.tex, p);
+      gl.uniform1f(p.uniforms.amount, amount);
+      gl.uniform1i(p.uniforms.slice, z);
+    });
+  }
+  doubleFBO.swap();
+}
+
+// --- Matrix math ---
+function perspective(fov, asp, near, far) {
+  const f = 1/Math.tan(fov/2), nf = 1/(near-far);
+  return new Float32Array([f/asp,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
+}
+
+function lookAtMatrix(eye, center, up) {
+  const zx = eye[0]-center[0], zy = eye[1]-center[1], zz = eye[2]-center[2];
+  let l = Math.sqrt(zx*zx+zy*zy+zz*zz);
+  const fzx=zx/l, fzy=zy/l, fzz=zz/l;
+  let sx = up[1]*fzz-up[2]*fzy, sy = up[2]*fzx-up[0]*fzz, sz = up[0]*fzy-up[1]*fzx;
+  l = Math.sqrt(sx*sx+sy*sy+sz*sz);
+  sx/=l; sy/=l; sz/=l;
+  const ux = fzy*sz-fzz*sy, uy = fzz*sx-fzx*sz, uz = fzx*sy-fzy*sx;
+  return new Float32Array([
+    sx,ux,fzx,0, sy,uy,fzy,0, sz,uz,fzz,0,
+    -(sx*eye[0]+sy*eye[1]+sz*eye[2]),
+    -(ux*eye[0]+uy*eye[1]+uz*eye[2]),
+    -(fzx*eye[0]+fzy*eye[1]+fzz*eye[2]),
+    1
+  ]);
+}
+
+function mat4mul(a, b) {
+  const r = new Float32Array(16);
+  for (let i=0;i<4;i++) for (let j=0;j<4;j++) for (let k=0;k<4;k++)
+    r[j*4+i] += a[k*4+i]*b[j*4+k];
+  return r;
+}
+
+function mat4inv(m) {
+  const o=new Float32Array(16);
+  const m0=m[0],m1=m[1],m2=m[2],m3=m[3],m4=m[4],m5=m[5],m6=m[6],m7=m[7];
+  const m8=m[8],m9=m[9],m10=m[10],m11=m[11],m12=m[12],m13=m[13],m14=m[14],m15=m[15];
+  const A=m5*(m10*m15-m11*m14)-m6*(m9*m15-m11*m13)+m7*(m9*m14-m10*m13);
+  const B=-(m4*(m10*m15-m11*m14)-m6*(m8*m15-m11*m12)+m7*(m8*m14-m10*m12));
+  const C=m4*(m9*m15-m11*m13)-m5*(m8*m15-m11*m12)+m7*(m8*m13-m9*m12);
+  const D=-(m4*(m9*m14-m10*m13)-m5*(m8*m14-m10*m12)+m6*(m8*m13-m9*m12));
+  let det=m0*A+m1*B+m2*C+m3*D;
+  if(Math.abs(det)<1e-10) return new Float32Array(16);
+  det=1/det;
+  o[0]=A*det; o[1]=-(m1*(m10*m15-m11*m14)-m2*(m9*m15-m11*m13)+m3*(m9*m14-m10*m13))*det;
+  o[2]=(m1*(m6*m15-m7*m14)-m2*(m5*m15-m7*m13)+m3*(m5*m14-m6*m13))*det;
+  o[3]=-(m1*(m6*m11-m7*m10)-m2*(m5*m11-m7*m9)+m3*(m5*m10-m6*m9))*det;
+  o[4]=B*det; o[5]=(m0*(m10*m15-m11*m14)-m2*(m8*m15-m11*m12)+m3*(m8*m14-m10*m12))*det;
+  o[6]=-(m0*(m6*m15-m7*m14)-m2*(m4*m15-m7*m12)+m3*(m4*m14-m6*m12))*det;
+  o[7]=(m0*(m6*m11-m7*m10)-m2*(m4*m11-m7*m8)+m3*(m4*m10-m6*m8))*det;
+  o[8]=C*det; o[9]=-(m0*(m9*m15-m11*m13)-m1*(m8*m15-m11*m12)+m3*(m8*m13-m9*m12))*det;
+  o[10]=(m0*(m5*m15-m7*m13)-m1*(m4*m15-m7*m12)+m3*(m4*m13-m5*m12))*det;
+  o[11]=-(m0*(m5*m11-m7*m9)-m1*(m4*m11-m7*m8)+m3*(m4*m9-m5*m8))*det;
+  o[12]=D*det; o[13]=(m0*(m9*m14-m10*m13)-m1*(m8*m14-m10*m12)+m2*(m8*m13-m9*m12))*det;
+  o[14]=-(m0*(m5*m14-m6*m13)-m1*(m4*m14-m6*m12)+m2*(m4*m13-m5*m12))*det;
+  o[15]=(m0*(m5*m10-m6*m9)-m1*(m4*m10-m6*m8)+m2*(m4*m9-m5*m8))*det;
+  return o;
+}
+
+// --- Camera ---
+let camTheta = 0.5, camPhi = 0.3, camDist = 2.5;
+const camTarget = [0.5, 0.5, 0.5];
+
+function getEye() {
+  return [
+    camTarget[0] + camDist * Math.cos(camPhi) * Math.sin(camTheta),
+    camTarget[1] + camDist * Math.sin(camPhi),
+    camTarget[2] + camDist * Math.cos(camPhi) * Math.cos(camTheta),
+  ];
+}
+
+// --- Display ---
+function display() {
+  const p = P.display;
+  if (!p) return;
+  drawToScreen(p, () => {
+    bindTex('uDye', dye.read.tex, p);
+    const eye = getEye();
+    const proj = perspective(Math.PI/4, W/H, 0.1, 100);
+    const view = lookAtMatrix(eye, camTarget, [0,1,0]);
+    const vp = mat4mul(proj, view);
+    const invVP = mat4inv(vp);
+    gl.uniformMatrix4fv(p.uniforms.invViewProj, false, invVP);
+    gl.uniform3f(p.uniforms.camPos, eye[0], eye[1], eye[2]);
+  });
+}
+
+// Debug: show slice 32 of dye
+function debugSlice() {
+  const p = P.sliceView;
+  if (!p) return;
+  drawToScreen(p, () => {
+    bindTex('uTex', dye.read.tex, p);
+    gl.uniform1i(p.uniforms.slice, 32);
+  });
+}
+
+// --- Input ---
+const ptr = { x:0, y:0, px:0, py:0, down:false, btn:0 };
+let brushDepth = 0.5, brushSize = 0.003;
+
+function randColor() {
+  const r = () => Math.random()*0.6+0.4;
+  const i = Math.floor(Math.random()*3);
+  const c = [0.05, 0.05, 0.05];
+  c[i] = r(); c[(i+1)%3] = r()*0.3;
+  return c;
+}
+let curColor = randColor();
+
+canvas.addEventListener('pointerdown', e => {
+  ptr.down = true; ptr.btn = e.button;
+  ptr.px = ptr.x = e.offsetX / W;
+  ptr.py = ptr.y = 1 - e.offsetY / H;
+  if (e.button === 0) curColor = randColor();
+});
+canvas.addEventListener('pointermove', e => {
+  ptr.px=ptr.x; ptr.py=ptr.y;
+  ptr.x=e.offsetX/W; ptr.y=1-e.offsetY/H;
+});
+canvas.addEventListener('pointerup', () => ptr.down=false);
+canvas.addEventListener('pointerleave', () => ptr.down=false);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => {
+  if (e.shiftKey) brushDepth = Math.max(0.05, Math.min(0.95, brushDepth + e.deltaY*0.001));
+  else { brushSize *= e.deltaY>0?0.9:1.1; brushSize = Math.max(0.0005, Math.min(0.02, brushSize)); }
+  e.preventDefault();
+}, { passive:false });
+
+// --- FPS ---
+let fc=0, lt=performance.now();
+const fpsEl = document.getElementById('fps');
+let useDebugView = false;
+document.addEventListener('keydown', e => {
+  if (e.key === 'd') { useDebugView = !useDebugView; dbg('debug view: ' + useDebugView); }
+});
+
+// --- Initial splats to seed the volume ---
+function initialSplats() {
+  doSplat(dye, [0.5, 0.5, 0.5], [200, 50, 10], 20);
+  doSplat(vel, [0.5, 0.5, 0.5], [100, 100, 50], 20);
+  doSplat(dye, [0.3, 0.7, 0.4], [10, 200, 30], 15);
+  doSplat(dye, [0.7, 0.3, 0.6], [50, 10, 200], 15);
+  doSplat(dye, [0.5, 0.5, 0.3], [200, 100, 10], 10);
+}
+initialSplats();
+
+// --- Main loop ---
+let frameNum = 0;
+function step() {
+  frameNum++;
+
+  // Camera orbit
+  if (ptr.down && ptr.btn === 2) {
+    camTheta -= (ptr.x-ptr.px)*3;
+    camPhi = Math.max(-1.2, Math.min(1.2, camPhi + (ptr.y-ptr.py)*3));
+  }
+
+  // Inject
+  if (ptr.down && ptr.btn === 0) {
+    const dx = (ptr.x-ptr.px)*10, dy = (ptr.y-ptr.py)*10;
+    const speed = Math.sqrt(dx*dx+dy*dy);
+    const pt = [ptr.x, ptr.y, brushDepth];
+    const s = brushSize * 800;
+
+    if (!e_shiftKey && speed > 0.001) {
+      doSplat(vel, pt, [dx*200, dy*200, 0], s * N);
+    }
+    const intensity = Math.min(speed*4, 2.0);
+    doSplat(dye, pt, curColor.map(c=>c*intensity*50), s * N * 0.5);
+  }
+
+  // Sim
+  advect3D(vel.write, vel.read, vel.read, DT, VEL_DISS);
+  vel.swap();
+
+  computeDivergence(divFBO, vel.read);
+
+  clearDoubleFBO(pres, 0.8);
+
+  for (let i = 0; i < PRESSURE_ITERS; i++) {
+    solvePressure(pres.write, pres.read, divFBO);
+    pres.swap();
+  }
+
+  subtractGradient(vel.write, pres.read, vel.read);
+  vel.swap();
+
+  advect3D(dye.write, vel.read, dye.read, DT, DYE_DISS);
+  dye.swap();
+
+  // Render
+  if (useDebugView) debugSlice();
+  else display();
+
+  fc++;
+  const now = performance.now();
+  if (now-lt >= 1000) {
+    fpsEl.textContent = fc + ' fps | frame ' + frameNum;
+    fc=0; lt=now;
+  }
+}
+
+// Check for shift key state (need to track it)
+let e_shiftKey = false;
+document.addEventListener('keydown', e => { if(e.key==='Shift') e_shiftKey=true; });
+document.addEventListener('keyup', e => { if(e.key==='Shift') e_shiftKey=false; });
+
+(function animate() {
+  requestAnimationFrame(animate);
+  step();
+})();
+</script>
+</body>
+</html>
